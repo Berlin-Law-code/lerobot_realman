@@ -517,12 +517,20 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
         )
 
-        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        self.max_action_dim = config.max_action_dim
+        self.max_torque_dim = config.max_torque_dim
+        self.joint_dim = self.max_action_dim + self.max_torque_dim
+        self.torque_history_horizon = config.torque_history_horizon
+
+        self.action_in_proj = nn.Linear(self.max_action_dim, action_expert_config.width)
+        self.torque_in_proj = nn.Linear(self.max_torque_dim, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, self.joint_dim)
 
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
-        self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+        self.action_time_mlp_in = nn.Linear(3 * action_expert_config.width, action_expert_config.width)
         self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        self.torque_history_proj = nn.Linear(self.max_torque_dim, action_expert_config.width)
+        self.torque_history_pos_emb = nn.Embedding(self.torque_history_horizon, action_expert_config.width)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -632,8 +640,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, state, torque_history, noisy_actions, noisy_torques, timestep):
+        """Embed conditioning tokens (state, torque history) and current noisy joint tokens."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -653,6 +661,24 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks.append(state_mask)
         att_masks += [1]
 
+        # Embed torque history tokens with positional encoding
+        if torque_history.dtype != state_emb.dtype:
+            torque_history = torque_history.to(state_emb.dtype)
+
+        def torque_hist_proj(torque_hist):
+            return self.torque_history_proj(torque_hist)
+
+        torque_hist_emb = self._apply_checkpoint(torque_hist_proj, torque_history)
+        hist_len = torque_hist_emb.shape[1]
+        if hist_len > 0:
+            pos_ids = torch.arange(hist_len, device=device)
+            pos_emb = self.torque_history_pos_emb(pos_ids)
+            torque_hist_emb = torque_hist_emb + pos_emb.unsqueeze(0)
+            embs.append(torque_hist_emb)
+            torque_hist_mask = torch.ones(bsize, hist_len, dtype=torch.bool, device=device)
+            pad_masks.append(torque_hist_mask)
+            att_masks += [1] + ([0] * (hist_len - 1))
+
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
@@ -663,21 +689,25 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
 
-        # Fuse timestep + action information using an MLP
+        # Fuse timestep, action and torque information using an MLP
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
+        def torque_proj_func(noisy_torques):
+            return self.torque_in_proj(noisy_torques)
+
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+        torque_emb = self._apply_checkpoint(torque_proj_func, noisy_torques)
 
         time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        joint_inputs = torch.cat([action_emb, torque_emb, time_emb], dim=2)
 
-        def mlp_func(action_time_emb):
-            x = self.action_time_mlp_in(action_time_emb)
+        def mlp_func(joint_inputs):
+            x = self.action_time_mlp_in(joint_inputs)
             x = F.silu(x)
             return self.action_time_mlp_out(x)
 
-        action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+        action_time_emb = self._apply_checkpoint(mlp_func, joint_inputs)
         adarms_cond = None
 
         embs.append(action_time_emb)
@@ -696,23 +726,50 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        torque_history,
+        torques,
+        noise=None,
+        time=None,
+    ) -> dict[str, Tensor]:
+        """Do a full training forward pass and compute the loss components."""
+        bsize = actions.shape[0]
+        device = actions.device
+
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            joint_shape = (bsize, self.config.chunk_size, self.joint_dim)
+            noise = self.sample_noise(joint_shape, device)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(bsize, device)
+
+        if torques.dtype != actions.dtype:
+            torques = torques.to(actions.dtype)
+
+        if noise.dtype != actions.dtype:
+            noise = noise.to(actions.dtype)
+
+        noise_actions = noise[..., : self.max_action_dim]
+        noise_torques = noise[..., self.max_action_dim :]
 
         time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t_actions = time_expanded * noise_actions + (1 - time_expanded) * actions
+        x_t_torques = time_expanded * noise_torques + (1 - time_expanded) * torques
+        u_actions = noise_actions - actions
+        u_torques = noise_torques - torques
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, torque_history, x_t_actions, x_t_torques, time
+        )
 
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -750,14 +807,27 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_joint = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_actions = v_joint[..., : self.max_action_dim]
+        v_torques = v_joint[..., self.max_action_dim :]
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss_action = F.mse_loss(u_actions, v_actions, reduction="none")
+        loss_torque = F.mse_loss(u_torques, v_torques, reduction="none")
+
+        return {"loss_action": loss_action, "loss_torque": loss_torque}
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
-        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, num_steps=None
-    ) -> Tensor:
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        torque_history,
+        noise=None,
+        num_steps=None,
+    ) -> tuple[Tensor, Tensor]:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
@@ -767,12 +837,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
-            actions_shape = (
+            joint_shape = (
                 bsize,
                 self.config.chunk_size,
-                self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
-            noise = self.sample_noise(actions_shape, device)
+                self.joint_dim,
+            )
+            noise = self.sample_noise(joint_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
@@ -802,24 +872,32 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 state,
                 prefix_pad_masks,
                 past_key_values,
+                torque_history,
                 x_t,
                 expanded_time,
             )
             x_t = x_t + dt * v_t
             time += dt
 
-        return x_t
+        actions = x_t[..., : self.max_action_dim]
+        torques = x_t[..., self.max_action_dim :]
+        return actions, torques
 
     def denoise_step(
         self,
         state,
         prefix_pad_masks,
         past_key_values,
+        torque_history,
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        noisy_actions = x_t[..., : self.max_action_dim]
+        noisy_torques = x_t[..., self.max_action_dim :]
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, torque_history, noisy_actions, noisy_torques, timestep
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1059,6 +1137,16 @@ class PI0Policy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
+    @staticmethod
+    def _pad_last_dim(tensor: Tensor, target_dim: int) -> Tensor:
+        """Pad the last dimension of a tensor to the desired size."""
+        if tensor.shape[-1] >= target_dim:
+            return tensor
+        pad_size = target_dim - tensor.shape[-1]
+        pad_shape = tensor.shape[:-1] + (pad_size,)
+        pad_tensor = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        return torch.cat([tensor, pad_tensor], dim=-1)
+
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
@@ -1127,12 +1215,95 @@ class PI0Policy(PreTrainedPolicy):
     def prepare_state(self, batch):
         """Pad state"""
         state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
+        if state.dtype != torch.float32:
+            state = state.to(torch.float32)
         return state
 
     def prepare_action(self, batch):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        if actions.dtype != torch.float32:
+            actions = actions.to(torch.float32)
         return actions
+
+    def prepare_torque(
+        self, batch: dict[str, Tensor], require_targets: bool = True
+    ) -> tuple[Tensor, Tensor | None, int, Tensor | None]:
+        """Prepare torque history and targets from the batch."""
+        key = self.config.torque_feature_key
+        if key not in batch:
+            raise KeyError(
+                f"{key} missing in batch. Please ensure the dataset includes torque observations."
+            )
+
+        torque = batch[key]
+        if torque.dtype != torch.float32:
+            torque = torque.to(torch.float32)
+
+        if torque.ndim == 2:
+            torque = torque.unsqueeze(1)
+
+        total_required = self.config.torque_history_horizon + self.config.chunk_size
+        current_len = torque.shape[1]
+
+        if current_len < total_required:
+            pad_len = total_required - current_len
+            pad = torch.zeros(
+                torque.shape[0],
+                pad_len,
+                torque.shape[2],
+                dtype=torque.dtype,
+                device=torque.device,
+            )
+            torque = torch.cat([pad, torque], dim=1)
+            torque = torque[:, -total_required:, :]
+        elif current_len > total_required:
+            torque = torque[:, -total_required:, :]
+
+        pad_key = f"{key}_is_pad"
+        pad_mask = batch.get(pad_key)
+        if pad_mask is not None:
+            pad_mask = pad_mask.to(torch.bool)
+            if pad_mask.shape[1] < torque.shape[1]:
+                pad_extension = torch.zeros(
+                    torque.shape[0],
+                    torque.shape[1] - pad_mask.shape[1],
+                    dtype=torch.bool,
+                    device=pad_mask.device,
+                )
+                pad_mask = torch.cat([torch.ones_like(pad_extension), pad_mask], dim=1)
+                pad_mask = pad_mask[:, -torque.shape[1] :]
+            elif pad_mask.shape[1] > torque.shape[1]:
+                pad_mask = pad_mask[:, -torque.shape[1] :]
+            torque = torque.masked_fill(pad_mask[:, :, None], 0.0)
+            valid_mask = (~pad_mask).to(torch.bool)
+        else:
+            valid_mask = torch.ones(
+                torque.shape[0], torque.shape[1], dtype=torch.bool, device=torque.device
+            )
+
+        history = torque[:, : self.config.torque_history_horizon]
+        targets = torque[
+            :, self.config.torque_history_horizon : self.config.torque_history_horizon + self.config.chunk_size
+        ]
+
+        history = self._pad_last_dim(history, self.config.max_torque_dim)
+        targets = self._pad_last_dim(targets, self.config.max_torque_dim)
+
+        target_mask: Tensor | None
+        if require_targets:
+            target_mask = valid_mask[
+                :, self.config.torque_history_horizon : self.config.torque_history_horizon + self.config.chunk_size
+            ].unsqueeze(-1)
+            target_mask = target_mask.to(targets.dtype)
+        else:
+            target_mask = None
+
+        if not require_targets:
+            targets = None
+
+        actual_dim = min(batch[key].shape[-1], self.config.max_torque_dim)
+        return history, targets, actual_dim, target_mask
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -1156,9 +1327,13 @@ class PI0Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
+        torque_history, _, _, _ = self.prepare_torque(batch, require_targets=False)
+        torque_history = torque_history.to(state.device)
 
         # Sample actions using the model
-        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state)
+        actions, _ = self.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state, torque_history
+        )
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1174,19 +1349,64 @@ class PI0Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
+        torque_history, torque_targets, torque_dim, torque_mask = self.prepare_torque(
+            batch, require_targets=True
+        )
+        if torque_targets is None:
+            raise ValueError("Torque targets could not be prepared for training.")
+        torque_history = torque_history.to(actions.device)
+        torque_targets = torque_targets.to(actions.device)
 
         # Compute loss
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            torque_history,
+            torque_targets,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        action_losses = losses["loss_action"][:, :, :original_action_dim]
+        torque_losses = losses["loss_torque"][:, :, :torque_dim]
 
-        loss = losses.mean()
+        loss_action = action_losses.mean()
+        torque_mask_expanded: Tensor | None = None
+        if torque_mask is not None:
+            torque_mask = torque_mask.to(torque_losses.device)
+            torque_mask_expanded = torque_mask.expand_as(torque_losses)
+            weighted_torque = (torque_losses * torque_mask_expanded).sum()
+            valid_torque = torque_mask_expanded.sum().clamp_min(1.0)
+            loss_torque = weighted_torque / valid_torque
+        else:
+            loss_torque = torque_losses.mean()
+        loss = loss_action + self.config.torque_loss_weight * loss_torque
+
+        action_per_dim = action_losses.mean(dim=[0, 1])
+        if torque_mask_expanded is None:
+            torque_per_dim = torque_losses.mean(dim=[0, 1])
+        else:
+            torque_per_dim = (torque_losses * torque_mask_expanded).sum(dim=[0, 1]) / torque_mask_expanded.sum(
+                dim=[0, 1]
+            ).clamp_min(1.0)
 
         loss_dict = {
             "loss": loss.item(),
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_action": loss_action.item(),
+            "loss_torque": loss_torque.item(),
+            "loss_per_dim": torch.cat(
+                [action_per_dim, self.config.torque_loss_weight * torque_per_dim], dim=0
+            )
+            .detach()
+            .cpu()
+            .numpy()
+            .tolist(),
+            "loss_per_dim_action": action_per_dim.detach().cpu().numpy().tolist(),
+            "loss_per_dim_torque": torque_per_dim.detach().cpu().numpy().tolist(),
         }
 
         return loss, loss_dict

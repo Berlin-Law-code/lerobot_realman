@@ -62,6 +62,12 @@ def resolve_delta_timestamps(
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
+    extra_delta_indices = getattr(cfg, "extra_delta_indices", None)
+    if extra_delta_indices:
+        for key, indices in extra_delta_indices.items():
+            if key in ds_meta.features:
+                delta_timestamps[key] = [i / ds_meta.fps for i in indices]
+
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 

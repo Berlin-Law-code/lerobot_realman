@@ -37,6 +37,12 @@ class PI0Config(PreTrainedConfig):
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
+    max_torque_dim: int = 16  # Padded torque dimension used for history/targets
+
+    # Torque modeling
+    torque_feature_key: str = "observation.joint_torques"
+    torque_history_horizon: int = 50  # Number of historical torque steps provided as conditioning (H)
+    torque_loss_weight: float = 1.0  # Weighting factor β for torque prediction loss
 
     # Flow matching parameters: see openpi `PI0Pytorch`
     num_inference_steps: int = 10  # Number of denoising steps during inference
@@ -100,6 +106,12 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.torque_history_horizon <= 0:
+            raise ValueError("torque_history_horizon must be > 0")
+        if self.max_torque_dim <= 0:
+            raise ValueError("max_torque_dim must be > 0")
+        if self.torque_loss_weight < 0:
+            raise ValueError("torque_loss_weight must be >= 0")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -141,6 +153,13 @@ class PI0Config(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
         )
+
+    @property
+    def extra_delta_indices(self) -> dict[str, list[int]]:
+        """Additional per-feature delta indices required for torque history/targets."""
+        history = list(range(-self.torque_history_horizon, 0))
+        future = list(range(0, self.chunk_size))
+        return {self.torque_feature_key: history + future}
 
     @property
     def observation_delta_indices(self) -> None:

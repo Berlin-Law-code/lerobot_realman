@@ -41,7 +41,7 @@ from tests.utils import require_cuda  # noqa: E402
 def test_policy_instantiation():
     # Create config
     set_seed(42)
-    config = PI0Config(max_action_dim=7, max_state_dim=14, dtype="float32")
+    config = PI0Config(max_action_dim=7, max_state_dim=14, max_torque_dim=7, dtype="float32")
 
     # Set up input_features and output_features in the config
     from lerobot.configs.types import FeatureType, PolicyFeature
@@ -54,6 +54,10 @@ def test_policy_instantiation():
         "observation.images.base_0_rgb": PolicyFeature(
             type=FeatureType.VISUAL,
             shape=(3, 224, 224),
+        ),
+        "observation.joint_torques": PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(config.torque_history_horizon + config.chunk_size, 7),
         ),
     }
 
@@ -78,6 +82,10 @@ def test_policy_instantiation():
             "mean": torch.zeros(3, 224, 224),
             "std": torch.ones(3, 224, 224),
         },
+        "observation.joint_torques": {
+            "mean": torch.zeros(config.torque_history_horizon + config.chunk_size, 7),
+            "std": torch.ones(config.torque_history_horizon + config.chunk_size, 7),
+        },
     }
 
     # Instantiate policy
@@ -92,6 +100,13 @@ def test_policy_instantiation():
         "observation.images.base_0_rgb": torch.rand(
             batch_size, 3, 224, 224, dtype=torch.float32, device=device
         ),  # Use rand for [0,1] range
+        "observation.joint_torques": torch.randn(
+            batch_size,
+            config.torque_history_horizon + config.chunk_size,
+            7,
+            dtype=torch.float32,
+            device=device,
+        ),
         "task": ["Pick up the object"] * batch_size,
     }
     batch = preprocessor(batch)
