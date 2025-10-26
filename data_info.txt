@@ -1,0 +1,24 @@
+columns: ['observation.joint_positions', 'observation.end_effector_pose', 'observation.force_readings', 'observation.joint_currents', 'observation.joint_torques', 'observation.action_target_pose', 'observation.button_pressed', 'observation.command_success', 'observation.force_exceeded', 'timestamp', 'frame_index', 'episode_index', 'index', 'task_index']
+nrows: 2444
+observation.joint_positions: fixed_size_list<element: double>[7]
+  child 0, element: double
+observation.end_effector_pose: fixed_size_list<element: double>[6]
+  child 0, element: double
+observation.force_readings: fixed_size_list<element: double>[6]
+  child 0, element: double
+observation.joint_currents: fixed_size_list<element: double>[7]
+  child 0, element: double
+observation.joint_torques: fixed_size_list<element: double>[7]
+  child 0, element: double
+observation.action_target_pose: fixed_size_list<element: double>[6]
+  child 0, element: double
+observation.button_pressed: bool
+observation.command_success: bool
+observation.force_exceeded: bool
+timestamp: float
+frame_index: int64
+episode_index: int64
+index: int64
+task_index: int64
+-- schema metadata --
+huggingface: '{"info": {"features": {"observation.joint_positions": {"fea' + 1136

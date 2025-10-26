@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import annotations
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
@@ -313,7 +314,7 @@ class LeRobotDatasetMetadata:
         else:
             new_tasks = [task for task in tasks if task not in self.tasks.index]
             new_task_indices = range(len(self.tasks), len(self.tasks) + len(new_tasks))
-            for task_idx, task in zip(new_task_indices, new_tasks, strict=False):
+            for task_idx, task in zip(new_task_indices, new_tasks):
                 self.tasks.loc[task] = task_idx
 
         if len(new_tasks) > 0:
@@ -1535,7 +1536,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 "Multiple datasets were provided but they had no keys common to all of them. "
                 "The multi-dataset functionality currently only keeps common keys."
             )
-        for repo_id, ds in zip(self.repo_ids, self._datasets, strict=True):
+        for repo_id, ds in zip(self.repo_ids, self._datasets):
             extra_keys = set(ds.features).difference(intersection_features)
             logging.warning(
                 f"keys {extra_keys} of {repo_id} were disabled as they are not contained in all the "

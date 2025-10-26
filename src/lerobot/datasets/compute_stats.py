@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import annotations
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
@@ -156,12 +157,11 @@ class RunningQuantileStats:
 
     def _compute_quantiles(self) -> list[np.ndarray]:
         """Compute quantiles based on histograms."""
-        results = []
+        results: list[np.ndarray] = []
         for q in self._quantile_list:
             target_count = q * self._count
-            q_values = []
-
-            for hist, edges in zip(self._histograms, self._bin_edges, strict=True):
+            q_values: list[float] = []
+            for hist, edges in zip(self._histograms, self._bin_edges):
                 q_value = self._compute_single_quantile(hist, edges, target_count)
                 q_values.append(q_value)
 

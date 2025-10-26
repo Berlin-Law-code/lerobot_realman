@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import annotations
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
@@ -206,7 +207,7 @@ def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
     """
     serialized_dict = {}
     for key, value in flatten_dict(stats).items():
-        if isinstance(value, (torch.Tensor | np.ndarray)):
+        if isinstance(value, (torch.Tensor, np.ndarray)):
             serialized_dict[key] = value.tolist()
         elif isinstance(value, list) and isinstance(value[0], (int | float | list)):
             serialized_dict[key] = value
