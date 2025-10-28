@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import numpy as np
@@ -260,6 +261,8 @@ def create_dataset(
     fps: int,
     image_shape: tuple[int, int],
     use_videos: bool,
+    image_writer_processes: int,
+    image_writer_threads: int,
 ) -> LeRobotDataset:
     """Instantiate an empty LeRobot dataset ready to record episodes."""
 
@@ -341,6 +344,8 @@ def create_dataset(
         robot_type="realman",
         use_videos=use_videos,
         batch_encoding_size=1,
+        image_writer_processes=max(0, image_writer_processes),
+        image_writer_threads=max(1, image_writer_threads),
     )
 
 
@@ -423,6 +428,22 @@ def main() -> None:
         action="store_true",
         help="Disable video export and keep image sequences.",
     )
+    default_processes = max(0, (os.cpu_count() or 2) // 2)
+    parser.add_argument(
+        "--image-writer-processes",
+        type=int,
+        default=default_processes,
+        help=(
+            "Number of worker processes to offload image serialization (default: half of available CPU cores). "
+            "Set to 0 to disable multiprocessing."
+        ),
+    )
+    parser.add_argument(
+        "--image-writer-threads",
+        type=int,
+        default=4,
+        help="Number of threads per process for image serialization (default: 4).",
+    )
     args = parser.parse_args()
 
     data_root: Path = args.data_root.resolve()
@@ -444,7 +465,15 @@ def main() -> None:
         width, height = img.size
 
     use_videos = not args.no_videos
-    dataset = create_dataset(output_dir, args.repo_id, args.fps, image_shape=(height, width), use_videos=use_videos)
+    dataset = create_dataset(
+        output_dir,
+        args.repo_id,
+        args.fps,
+        image_shape=(height, width),
+        use_videos=use_videos,
+        image_writer_processes=args.image_writer_processes,
+        image_writer_threads=args.image_writer_threads,
+    )
 
     for episode_dir in tqdm(episodes, desc="Converting episodes"):
         convert_episode(dataset, episode_dir)
