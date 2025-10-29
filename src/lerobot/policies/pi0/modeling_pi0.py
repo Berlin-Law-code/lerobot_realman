@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+import sys
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -1282,20 +1283,52 @@ class PI0Policy(PreTrainedPolicy):
                 torque.shape[0], torque.shape[1], dtype=torch.bool, device=torque.device
             )
 
+        def ensure_length(tensor: Tensor, target_len: int, pad_value: float | bool) -> Tensor:
+            """Match sequence length by trimming or padding along the time dimension."""
+            current_len = tensor.shape[1]
+            if current_len < target_len:
+                pad_shape = list(tensor.shape)
+                pad_shape[1] = target_len - current_len
+                pad = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
+                tensor = torch.cat([tensor, pad], dim=1)
+            elif current_len > target_len:
+                tensor = tensor[:, :target_len, ...]
+            return tensor
+
         history = torque[:, : self.config.torque_history_horizon]
-        targets = torque[
-            :, self.config.torque_history_horizon : self.config.torque_history_horizon + self.config.chunk_size
-        ]
-
         history = self._pad_last_dim(history, self.config.max_torque_dim)
-        targets = self._pad_last_dim(targets, self.config.max_torque_dim)
 
-        target_mask: Tensor | None
+        next_torque_key = getattr(self.config, "torque_target_feature_key", "next_torque")
+        targets: Tensor | None = None
+        target_mask: Tensor | None = None
+
+        if next_torque_key in batch:
+            targets = batch[next_torque_key]
+            if targets.dtype != torch.float32:
+                targets = targets.to(torch.float32)
+            if targets.ndim == 2:
+                targets = targets.unsqueeze(1)
+            targets = ensure_length(targets, self.config.chunk_size, 0.0)
+            targets = self._pad_last_dim(targets, self.config.max_torque_dim)
+
+            if require_targets:
+                pad_key = f"{next_torque_key}_is_pad"
+                next_pad_mask = batch.get(pad_key)
+                if next_pad_mask is not None:
+                    next_pad_mask = next_pad_mask.to(torch.bool)
+                    next_pad_mask = ensure_length(next_pad_mask, self.config.chunk_size, True)
+                    target_mask = (~next_pad_mask).unsqueeze(-1).to(targets.dtype)
+        else:
+            # If torque targets are missing in the dataset, exit the process
+            # Use sys.exit to raise SystemExit so the process terminates with a non-zero exit code.
+            sys.exit("Torque targets missing in batch")
+
         if require_targets:
-            target_mask = valid_mask[
-                :, self.config.torque_history_horizon : self.config.torque_history_horizon + self.config.chunk_size
-            ].unsqueeze(-1)
-            target_mask = target_mask.to(targets.dtype)
+            if target_mask is None:
+                target_mask = valid_mask[
+                    :, self.config.torque_history_horizon : self.config.torque_history_horizon + self.config.chunk_size
+                ].unsqueeze(-1)
+                target_mask = target_mask.to(targets.dtype)
         else:
             target_mask = None
 

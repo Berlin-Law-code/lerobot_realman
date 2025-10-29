@@ -74,7 +74,8 @@ class PI0Config(PreTrainedConfig):
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Optimizer settings: see openpi `AdamW``
-    optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
+    # optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
+    optimizer_lr: float = 1e-4  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01

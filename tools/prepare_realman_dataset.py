@@ -329,6 +329,11 @@ def create_dataset(
             "shape": (1,),
             "names": ["exceeded"],
         },
+        "next_torque": {
+            "dtype": "float32",
+            "shape": (len(JOINT_NAMES),),
+            "names": JOINT_NAMES,
+        },        
         "action": {
             "dtype": "float32",
             "shape": (len(JOINT_NAMES),),
@@ -389,6 +394,7 @@ def convert_episode(dataset: LeRobotDataset, episode_dir: Path) -> None:
             "observation.button_pressed": np.asarray([curr_obs["button_pressed"]], dtype=np.float32),
             "observation.command_success": np.asarray([curr_obs["command_success"]], dtype=np.float32),
             "observation.force_exceeded": np.asarray([curr_obs["force_exceeded"]], dtype=np.float32),
+            "next_torque": next_obs["joint_torques"].astype(np.float32),
             "action": next_joint_positions,
         }
 
